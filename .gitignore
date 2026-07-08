@@ -1,0 +1,7 @@
+# IntelliJ
+*.iml
+.idea/*
+!.idea/.name
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
