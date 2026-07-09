@@ -136,7 +136,7 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
 
 /**
  * A Gradle [ValueSource] provider that checks out a branch in an already-cloned
- * repository, fast-forwards it to the already-fetched remote-tracking branch, and
+ * repository, force-resets it to the already-fetched remote-tracking branch, and
  * reports the branch's tip commit SHA.
  *
  * Why a ValueSource? As with [GitRepositorySource], running the checkout here makes
@@ -160,9 +160,10 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
     }
 
     /**
-     * Checks out `branch` in the already-cloned `targetDirectory`, merges the already-fetched
-     * `origin/<branch>` to bring it up to date, and returns the branch's tip commit SHA.
-     * See the class KDoc for the caching rationale.
+     * Checks out `branch` in the already-cloned `targetDirectory`, force-resetting it to the
+     * already-fetched `origin/<branch>` (this clone is machine-owned, so any local state is
+     * discarded — which self-heals a clone whose upstream history was rewritten/recreated),
+     * and returns the branch's tip commit SHA. See the class KDoc for the caching rationale.
      */
     override fun obtain(): String? {
         val logger = Logging.getLogger(GitBranchSource::class.java)
@@ -170,15 +171,18 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
         val branch = parameters.branch.get()
         val targetDirectory = parameters.targetDirectory.get().asFile
 
-        logger.log(logLevel, "Checking out \"$branch\" and pulling latest in $targetDirectory")
+        logger.log(logLevel, "Checking out \"$branch\" and resetting to origin/$branch in $targetDirectory")
 
-        // Check out the branch
-        logger.log(logLevel, "  Checking out \"$branch\"")
-        parameters.runGit(targetDirectory, "checkout", branch)
-
-        // Bring it up to date with the already-fetched origin/<branch> (local merge, no network)
-        logger.log(logLevel, "  Pulling latest changes for $branch")
-        parameters.runGit(targetDirectory, "merge", "origin/$branch")
+        // Force this machine-owned clone to exactly match the already-fetched origin/<branch>,
+        // discarding any local state (no network). Unlike `merge origin/<branch>`, a force reset
+        // self-heals a clone whose upstream history was rewritten/recreated — where a merge fails
+        // with `CONFLICT (add/add)` or `refusing to merge unrelated histories` and leaves the clone
+        // stuck mid-merge — as well as one already left in that conflicted state by an earlier run.
+        // These clones are machine-managed, so there is never local work to preserve. `-B` creates
+        // the local branch (or resets it) to origin/<branch>; `-f` discards local modifications and
+        // clears any in-progress merge.
+        logger.log(logLevel, "  Resetting \"$branch\" to origin/$branch")
+        parameters.runGit(targetDirectory, "checkout", "-f", "-B", branch, "origin/$branch")
 
         // Get the latest commit hash for this branch
         val sha = parameters.runGit(targetDirectory, "rev-parse", branch)
@@ -223,7 +227,7 @@ fun getCheckoutGitRepositoryBranchProvider(branch: String,
  *     )
  *
  * This will clone the repository (if needed) and fetch from the remote, then check out
- * `branch` and fast-forward it to the fetched remote-tracking branch. Fetching is skipped
+ * `branch` and force-reset it to the fetched remote-tracking branch. Fetching is skipped
  * when Gradle is running offline, or via a property found in local.sonos.properties,
  * of the same name as what the [skipRemoteFetchProperty] argument provides.
  */
@@ -265,7 +269,7 @@ extra["cloneAndCheckoutGitRepositoryBranch"] = fun(repo: String,
  *     checkoutGitRepositoryBranch("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and fast-forwards it to the already-fetched `origin/<branch>`.
+ * checks out `branch` and force-resets it to the already-fetched `origin/<branch>`.
  */
 extra["checkoutGitRepositoryBranch"] = fun(branch: String,
                                            targetDirectory: Directory,
@@ -285,7 +289,7 @@ extra["checkoutGitRepositoryBranch"] = fun(branch: String,
  *     val provider = getCheckoutGitRepositoryBranchProvider("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and fast-forwards it to the already-fetched `origin/<branch>`.
+ * checks out `branch` and force-resets it to the already-fetched `origin/<branch>`.
  */
 extra["getCheckoutGitRepositoryBranchProvider"] = fun(branch: String,
                                                       targetDirectory: Directory,
