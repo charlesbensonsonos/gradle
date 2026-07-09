@@ -24,11 +24,17 @@ manual version bump needed.
   (`git rev-list --branches --remotes --max-count=1`), which changes whenever any
   branch gets a new commit.
 - **`GitBranchSource`** — checks out `branch` in an already-cloned
-  `targetDirectory` and force-resets it to the already-fetched `origin/<branch>`
-  (a local `git checkout -f -B`, no network). The clone is machine-owned, so any
-  local state is discarded — this self-heals a clone whose upstream history was
-  rewritten/recreated (where a `git merge` would fail and leave the clone stuck
-  mid-merge). It returns the branch's **tip commit SHA**
+  `targetDirectory` and brings it in line with the already-fetched
+  `origin/<branch>` (all local operations, no network), using tiered logic:
+  if the local branch is equal to or **ahead** of origin it is left untouched
+  (deliberate local commits — e.g. developer hacking on the clone — are
+  preserved); if it is simply **behind** it is fast-forwarded
+  (`merge --ff-only`); only if the histories have **diverged** (e.g. the
+  upstream history was rewritten/recreated) or the clone is in a broken state
+  (e.g. stuck mid-merge) is it force-reset to `origin/<branch>`
+  (`checkout -f -B`), with a warning — a diverged local line cannot be
+  developer work on top of the current origin, so nothing meaningful is lost.
+  It returns the branch's **tip commit SHA**
   (`git rev-parse <branch>`), which changes when that branch's tip changes.
 
 ## Entry points
@@ -36,12 +42,13 @@ manual version bump needed.
 Three convenience functions are registered on `extra`:
 
 - **`cloneAndCheckoutGitRepositoryBranch`** — the full path: clone (if needed),
-  fetch, check out `branch`, and force-reset it to the fetched remote-tracking
-  branch. Backed by both value sources.
+  fetch, check out `branch`, and update it from the fetched remote-tracking
+  branch (fast-forward when behind; local commits preserved when ahead;
+  force-reset only on divergence). Backed by both value sources.
 - **`checkoutGitRepositoryBranch`** — checkout only, for a repository that has
   **already** been cloned/fetched. It neither clones nor fetches; it just checks
-  out `branch` and force-resets it to the already-fetched `origin/<branch>`.
-  Backed by `GitBranchSource`.
+  out `branch` and updates it from the already-fetched `origin/<branch>` (same
+  tiered logic). Backed by `GitBranchSource`.
 - **`getCheckoutGitRepositoryBranchProvider`** — same as
   `checkoutGitRepositoryBranch`, but returns the `Provider<String>` (the branch's
   tip SHA) instead of running the checkout eagerly. Call `.get()` on the returned
@@ -77,7 +84,7 @@ val repo = layout.buildDirectory.dir("gradle").get()
 
 cloneAndCheckoutGitRepositoryBranch(
     "Sonos-Inc/gradle",            // repo: owner/name (SSH) or a file:// URI
-    "main",                        // branch to check out and force-reset
+    "main",                        // branch to check out and update
     repo,                          // local clone directory (Directory)
     "com.sonos.skip-fetch-latest", // skipRemoteFetchProperty (or null for offline-only)
     LogLevel.INFO,                 // log level for progress output
@@ -100,7 +107,7 @@ val checkoutGitRepositoryBranch =
 val repo = layout.buildDirectory.dir("gradle").get()
 
 checkoutGitRepositoryBranch(
-    "release/1.x",   // branch to check out and force-reset
+    "release/1.x",   // branch to check out and update
   repo,      // local directory of the already-cloned repo (Directory)
     LogLevel.INFO,   // log level for progress output
 )
@@ -115,7 +122,7 @@ apply(from = repo.file("common.gradle.kts"))
 | Parameter                 | Type        | Description                                                                                                     |
 |---------------------------|-------------|-----------------------------------------------------------------------------------------------------------------|
 | `repo`                    | `String`    | Repository to clone: a GitHub `owner/name` (SSH) or `file://` URI.                                              |
-| `branch`                  | `String`    | Git branch to check out and force-reset.                                                                       |
+| `branch`                  | `String`    | Git branch to check out and update.                                                                             |
 | `targetDirectory`         | `Directory` | Local directory the repo is cloned into (clone runs in its parent, using its name).                             |
 | `skipRemoteFetchProperty` | `String?`   | Property name in `local.sonos.properties` that skips the fetch when `true`; `null` to rely on `--offline` only. |
 | `logLevel`                | `LogLevel`  | Level at which progress is logged.                                                                              |
@@ -127,7 +134,7 @@ Both take the same parameters; `getCheckoutGitRepositoryBranchProvider` returns 
 
 | Parameter         | Type        | Description                                                |
 |-------------------|-------------|------------------------------------------------------------|
-| `branch`          | `String`    | Git branch to check out and force-reset.                  |
+| `branch`          | `String`    | Git branch to check out and update.                        |
 | `targetDirectory` | `Directory` | Local directory containing the already-cloned repository.  |
 | `logLevel`        | `LogLevel`  | Level at which progress is logged.                         |
 

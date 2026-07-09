@@ -6,8 +6,8 @@ import org.gradle.api.provider.Property
 import java.util.Properties
 
 /**
- * Mixin providing [runGit], a small helper for invoking `git` as an external process.
- * Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
+ * Mixin providing [runGit] and [tryGit], small helpers for invoking `git` as an external
+ * process. Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
  */
 interface GitCommand {
     // Runs git in [workingDir], returning trimmed stdout and failing loudly on a non-zero exit.
@@ -39,6 +39,21 @@ interface GitCommand {
                 """.trimMargin())
         }
         return output
+    }
+
+    // Runs git in [workingDir] like [runGit], but returns the exit code instead of
+    // throwing on failure — for commands used as predicates or best-effort attempts.
+    fun tryGit(workingDir: File, vararg args: String): Int {
+        val process = ProcessBuilder(listOf("git", *args))
+            .directory(workingDir)
+            .redirectErrorStream(true)
+            .also {
+                // Never block on an interactive credential prompt; fail fast instead.
+                it.environment()["GIT_TERMINAL_PROMPT"] = "0"
+            }
+            .start()
+        process.inputStream.bufferedReader().readText()
+        return process.waitFor()
     }
 }
 
@@ -136,8 +151,10 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
 
 /**
  * A Gradle [ValueSource] provider that checks out a branch in an already-cloned
- * repository, force-resets it to the already-fetched remote-tracking branch, and
- * reports the branch's tip commit SHA.
+ * repository, brings it in line with the already-fetched remote-tracking branch
+ * (fast-forwarding when behind, preserving local commits when ahead, and
+ * force-resetting only when the histories have diverged), and reports the
+ * branch's tip commit SHA.
  *
  * Why a ValueSource? As with [GitRepositorySource], running the checkout here makes
  * it a first-class configuration-cache input: Gradle re-runs [obtain] on each build
@@ -160,10 +177,20 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
     }
 
     /**
-     * Checks out `branch` in the already-cloned `targetDirectory`, force-resetting it to the
-     * already-fetched `origin/<branch>` (this clone is machine-owned, so any local state is
-     * discarded — which self-heals a clone whose upstream history was rewritten/recreated),
-     * and returns the branch's tip commit SHA. See the class KDoc for the caching rationale.
+     * Checks out `branch` in the already-cloned `targetDirectory`, brings it in line with the
+     * already-fetched `origin/<branch>` using tiered update logic, and returns the branch's
+     * tip commit SHA:
+     *
+     *  1. If the local branch is equal to or **ahead** of `origin/<branch>`, the clone is left
+     *     untouched — deliberate local (developer) commits on top of origin are preserved.
+     *  2. If it is simply **behind**, it is fast-forwarded to `origin/<branch>`
+     *     (`merge --ff-only`, a local operation — no network).
+     *  3. Only if the histories have **diverged** (e.g. the upstream repository's history was
+     *     rewritten/recreated), or the clone is in a broken state (e.g. left mid-merge), is this
+     *     machine-managed clone force-reset to `origin/<branch>`, with a warning — a diverged
+     *     local line cannot be developer work on top of the current origin.
+     *
+     * See the class KDoc for the caching rationale.
      */
     override fun obtain(): String? {
         val logger = Logging.getLogger(GitBranchSource::class.java)
@@ -171,18 +198,41 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
         val branch = parameters.branch.get()
         val targetDirectory = parameters.targetDirectory.get().asFile
 
-        logger.log(logLevel, "Checking out \"$branch\" and resetting to origin/$branch in $targetDirectory")
+        logger.log(logLevel, "Checking out \"$branch\" and updating it from origin/$branch in $targetDirectory")
 
-        // Force this machine-owned clone to exactly match the already-fetched origin/<branch>,
-        // discarding any local state (no network). Unlike `merge origin/<branch>`, a force reset
-        // self-heals a clone whose upstream history was rewritten/recreated — where a merge fails
-        // with `CONFLICT (add/add)` or `refusing to merge unrelated histories` and leaves the clone
-        // stuck mid-merge — as well as one already left in that conflicted state by an earlier run.
-        // These clones are machine-managed, so there is never local work to preserve. `-B` creates
-        // the local branch (or resets it) to origin/<branch>; `-f` discards local modifications and
-        // clears any in-progress merge.
-        logger.log(logLevel, "  Resetting \"$branch\" to origin/$branch")
-        parameters.runGit(targetDirectory, "checkout", "-f", "-B", branch, "origin/$branch")
+        // Check out the branch, creating it from origin/<branch> only if it doesn't exist locally.
+        // The checkout is allowed to fail here (e.g. a clone left mid-merge by the old merge-based
+        // update): that state is never deliberate local work, so it falls through to the force
+        // reset below instead of aborting the build.
+        logger.log(logLevel, "  Checking out \"$branch\"")
+        val checkedOut = if (parameters.tryGit(targetDirectory, "rev-parse", "--verify", "--quiet", "refs/heads/$branch") == 0) {
+            parameters.tryGit(targetDirectory, "checkout", branch) == 0
+        } else {
+            parameters.tryGit(targetDirectory, "checkout", "-B", branch, "origin/$branch") == 0
+        }
+
+        if (checkedOut && parameters.tryGit(targetDirectory, "merge-base", "--is-ancestor", "origin/$branch", branch) == 0) {
+            // origin/<branch> is an ancestor of the local branch: the clone is equal to or ahead
+            // of origin. Leave it untouched — developers deliberately work on top of these clones
+            // (often with fetching skipped), and their local commits must be preserved.
+            if (parameters.runGit(targetDirectory, "rev-parse", branch) !=
+                    parameters.runGit(targetDirectory, "rev-parse", "origin/$branch")) {
+                logger.lifecycle("  Local commits in $targetDirectory are ahead of origin/$branch — leaving clone as-is (developer changes preserved)")
+            }
+        } else if (checkedOut && parameters.tryGit(targetDirectory, "merge", "--ff-only", "origin/$branch") == 0) {
+            // The local branch was simply behind: it has been fast-forwarded to origin/<branch>.
+            // (`--ff-only` never creates a merge state, so a failure here is side-effect free.)
+            logger.log(logLevel, "  Fast-forwarded $branch to origin/$branch")
+        } else {
+            // The fast-forward was impossible (histories diverged or are unrelated — e.g. the
+            // upstream repository's history was rewritten/recreated), or the checkout itself
+            // failed (clone left mid-merge). A diverged local line cannot be developer work on
+            // top of the current origin, and these clones are machine-managed, so force-reset to
+            // origin: `-B` re-points the local branch at origin/<branch>; `-f` discards local
+            // modifications and clears any in-progress merge.
+            logger.warn("  Machine-managed clone in $targetDirectory has diverged from origin/$branch (upstream history rewritten?) — force-resetting it to origin/$branch")
+            parameters.runGit(targetDirectory, "checkout", "-f", "-B", branch, "origin/$branch")
+        }
 
         // Get the latest commit hash for this branch
         val sha = parameters.runGit(targetDirectory, "rev-parse", branch)
@@ -227,7 +277,9 @@ fun getCheckoutGitRepositoryBranchProvider(branch: String,
  *     )
  *
  * This will clone the repository (if needed) and fetch from the remote, then check out
- * `branch` and force-reset it to the fetched remote-tracking branch. Fetching is skipped
+ * `branch` and update it from the fetched remote-tracking branch (fast-forward when behind,
+ * local commits preserved when ahead, force-reset only if the histories have diverged —
+ * see [GitBranchSource.obtain]). Fetching is skipped
  * when Gradle is running offline, or via a property found in local.sonos.properties,
  * of the same name as what the [skipRemoteFetchProperty] argument provides.
  */
@@ -269,7 +321,9 @@ extra["cloneAndCheckoutGitRepositoryBranch"] = fun(repo: String,
  *     checkoutGitRepositoryBranch("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and force-resets it to the already-fetched `origin/<branch>`.
+ * checks out `branch` and updates it from the already-fetched `origin/<branch>` (fast-forward
+ * when behind, local commits preserved when ahead, force-reset only on divergence — see
+ * [GitBranchSource.obtain]).
  */
 extra["checkoutGitRepositoryBranch"] = fun(branch: String,
                                            targetDirectory: Directory,
@@ -289,7 +343,9 @@ extra["checkoutGitRepositoryBranch"] = fun(branch: String,
  *     val provider = getCheckoutGitRepositoryBranchProvider("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and force-resets it to the already-fetched `origin/<branch>`.
+ * checks out `branch` and updates it from the already-fetched `origin/<branch>` (fast-forward
+ * when behind, local commits preserved when ahead, force-reset only on divergence — see
+ * [GitBranchSource.obtain]).
  */
 extra["getCheckoutGitRepositoryBranchProvider"] = fun(branch: String,
                                                       targetDirectory: Directory,
