@@ -63,6 +63,20 @@ The property name is caller-supplied: pass the key to look up (e.g.
 `"com.sonos.skip-fetch-latest"`), or `null` to rely on offline mode
 alone. The clone itself still happens if `targetDirectory` doesn't exist yet.
 
+## Validating changes
+
+[`tests/validate.sh`](tests/validate.sh) drives the real script through Gradle
+against throwaway local `file://` repositories in a temp directory — no network,
+no credentials — and asserts the behavior described above: cloning, both
+fetch-skipping mechanisms, the self-healing reclones (and the preserved
+ahead/behind clones), all three entry points, the failure modes, and the
+configuration-cache store/reuse/invalidate cycle. Requires `git` and `gradle`
+on the PATH:
+
+```sh
+tests/validate.sh
+```
+
 ## Usage
 
 ### Clone, fetch, and check out a branch
