@@ -6,8 +6,8 @@ import org.gradle.api.provider.Property
 import java.util.Properties
 
 /**
- * Mixin providing [runGit] and [tryGit], small helpers for invoking `git` as an external
- * process. Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
+ * Mixin providing [runGit], a small helper for invoking `git` as an external process.
+ * Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
  */
 interface GitCommand {
     // Runs git in [workingDir], returning trimmed stdout and failing loudly on a non-zero exit.
@@ -40,11 +40,6 @@ interface GitCommand {
         }
         return output
     }
-
-    // Runs git in [workingDir] like [runGit], but returns whether it succeeded instead
-    // of throwing — for commands used as predicates or best-effort attempts.
-    fun tryGit(workingDir: File, vararg args: String): Boolean =
-        runCatching { runGit(workingDir, *args) }.isSuccess
 }
 
 /**
@@ -106,6 +101,9 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
 
         logger.log(logLevel, "Fetching $repo in $targetDirectory")
 
+        // True when the git command exits 0 — for commands used as predicates.
+        fun git(vararg args: String) = runCatching { parameters.runGit(targetDirectory, *args) }.isSuccess
+
         fun clone() {
             // A local `file://` repo is cloned as-is; anything else is treated as a
             // GitHub `owner/name` and cloned over SSH.
@@ -130,15 +128,18 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
         }
 
         // These clones are machine-managed: one that can no longer be updated in place is
-        // deleted, with a warning, and recloned from [repo] rather than left for manual repair.
-        fun deleteStaleClone(reason: String) {
+        // deleted and recreated from [repo] rather than left for manual repair.
+        fun deleteAndReclone(reason: String) {
             logger.warn("  Machine-managed clone in $targetDirectory $reason — deleting it and recloning")
             if (!targetDirectory.deleteRecursively()) {
                 throw GradleException("Could not delete $targetDirectory to reclone it from $repo — delete it manually and re-run")
             }
+            clone()
         }
 
-        if (targetDirectory.exists()) {
+        if (!targetDirectory.exists()) {
+            clone()
+        } else {
             // The URI forms clone() can produce for [repo] (SSH first, HTTPS fallback).
             val expected = if (repo.startsWith("file://")) {
                 listOf(repo)
@@ -153,14 +154,10 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
                 null
             }
             if (origin !in expected) {
-                deleteStaleClone("is not a clone of $repo (origin: $origin)")
-            } else if (parameters.tryGit(targetDirectory, "rev-parse", "--verify", "--quiet", "MERGE_HEAD")) {
-                deleteStaleClone("is stuck mid-merge")
+                deleteAndReclone("is not a clone of $repo (origin: $origin)")
+            } else if (git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")) {
+                deleteAndReclone("is stuck mid-merge")
             }
-        }
-
-        if (!targetDirectory.exists()) {
-            clone()
         }
 
         if (!skipFetch) {
@@ -175,13 +172,10 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
             val branch = runCatching {
                 parameters.runGit(targetDirectory, "rev-parse", "--abbrev-ref", "HEAD")
             }.getOrNull()
-            val diverged = branch != null &&
-                    parameters.tryGit(targetDirectory, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/$branch") &&
-                    !parameters.tryGit(targetDirectory, "merge-base", "--is-ancestor", "origin/$branch", branch) &&
-                    !parameters.tryGit(targetDirectory, "merge-base", "--is-ancestor", branch, "origin/$branch")
-            if (diverged) {
-                deleteStaleClone("has diverged from origin/$branch (upstream history rewritten or force-pushed?)")
-                clone()
+            if (branch != null && git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/$branch") &&
+                    !git("merge-base", "--is-ancestor", "origin/$branch", branch) &&
+                    !git("merge-base", "--is-ancestor", branch, "origin/$branch")) {
+                deleteAndReclone("has diverged from origin/$branch (upstream history rewritten or force-pushed?)")
             }
         }
 
