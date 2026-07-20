@@ -58,8 +58,12 @@ interface GitCommand {
  *  - The repository named by [Params.repo] is cloned into [Params.targetDirectory]
  *    (the clone runs in that directory's parent, using its name as the clone
  *    target), but only if that directory does not already exist.
- *  - If the directory exists but is not a clone of [Params.repo] (e.g. the configured
- *    repo changed), it is deleted and recloned, with a warning.
+ *  - An existing directory that can no longer be updated from [Params.repo] is deleted
+ *    and recloned, with a warning: its origin points at a different repository (the
+ *    configured repo changed), it is stuck mid-merge, or — after the fetch — its
+ *    checked-out branch has diverged from origin (upstream history rewritten or
+ *    force-pushed, so origin can no longer be merged). A clone that is merely ahead of
+ *    origin (deliberate local commits) or behind it (fast-forwardable) is left in place.
  *  - Unless [Params.skipFetch] is set, `git fetch` updates the remote-tracking refs.
  *  - `git rev-list --branches --remotes --max-count=1` yields the SHA of the latest
  *    commit across all branches, which changes whenever any branch gets a new commit.
@@ -82,10 +86,11 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
     }
 
     /**
-     * Clones the repository into `targetDirectory` if it does not already exist (deleting and
-     * recloning it first if it is not a clone of `repo`), fetches the latest changes from the
-     * remote (unless `skipFetch` is set), and returns the SHA of the latest commit across all
-     * branches. See the class KDoc for the caching rationale.
+     * Clones the repository into `targetDirectory` if it does not already exist, fetches the
+     * latest changes from the remote (unless `skipFetch` is set), and returns the SHA of the
+     * latest commit across all branches. An existing clone that can no longer be updated from
+     * `repo` (wrong origin, stuck mid-merge, or diverged from a rewritten upstream) is deleted
+     * and recloned. See the class KDoc for the caching rationale.
      */
     override fun obtain(): String? {
         val logger = Logging.getLogger(GitRepositorySource::class.java)
@@ -96,32 +101,10 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
 
         logger.log(logLevel, "Fetching $repo in $targetDirectory")
 
-        if (targetDirectory.exists()) {
-            // The configured [repo] may have changed since this directory was cloned (e.g. it
-            // now points at a moved or recreated repository). These clones are machine-managed,
-            // so delete the stale clone and let the clone below recreate it from [repo].
-            val origin = if (File(targetDirectory, ".git").exists()) {
-                runCatching {
-                    parameters.runGit(targetDirectory, "config", "--get", "remote.origin.url")
-                }.getOrNull()
-            } else {
-                null
-            }
-            // The URI forms the clone below can produce (SSH first, HTTPS fallback).
-            val expected = if (repo.startsWith("file://")) {
-                listOf(repo)
-            } else {
-                listOf("git@github.com:$repo.git", "https://github.com/$repo.git")
-            }
-            if (origin !in expected) {
-                logger.warn("  $targetDirectory is not a clone of $repo (origin: $origin) — deleting it and recloning")
-                if (!targetDirectory.deleteRecursively()) {
-                    throw GradleException("Could not delete $targetDirectory to reclone it from $repo — delete it manually and re-run")
-                }
-            }
-        }
+        // True when the git command exits 0 — for commands used as predicates.
+        fun git(vararg args: String) = runCatching { parameters.runGit(targetDirectory, *args) }.isSuccess
 
-        if (!targetDirectory.exists()) {
+        fun clone() {
             // A local `file://` repo is cloned as-is; anything else is treated as a
             // GitHub `owner/name` and cloned over SSH.
             var repoUri = if (repo.startsWith("file://")) {
@@ -144,9 +127,56 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
             }
         }
 
+        // These clones are machine-managed: one that can no longer be updated in place is
+        // deleted and recreated from [repo] rather than left for manual repair.
+        fun deleteAndReclone(reason: String) {
+            logger.warn("  Machine-managed clone in $targetDirectory $reason — deleting it and recloning")
+            if (!targetDirectory.deleteRecursively()) {
+                throw GradleException("Could not delete $targetDirectory to reclone it from $repo — delete it manually and re-run")
+            }
+            clone()
+        }
+
+        if (!targetDirectory.exists()) {
+            clone()
+        } else {
+            // The URI forms clone() can produce for [repo] (SSH first, HTTPS fallback).
+            val expected = if (repo.startsWith("file://")) {
+                listOf(repo)
+            } else {
+                listOf("git@github.com:$repo.git", "https://github.com/$repo.git")
+            }
+            val origin = if (File(targetDirectory, ".git").exists()) {
+                runCatching {
+                    parameters.runGit(targetDirectory, "config", "--get", "remote.origin.url")
+                }.getOrNull()
+            } else {
+                null
+            }
+            if (origin !in expected) {
+                deleteAndReclone("is not a clone of $repo (origin: $origin)")
+            } else if (git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")) {
+                deleteAndReclone("is stuck mid-merge")
+            }
+        }
+
         if (!skipFetch) {
             logger.log(logLevel, "  Fetching latest changes")
             parameters.runGit(targetDirectory, "fetch")
+
+            // The fetch may reveal that origin can no longer be merged or pulled: the checked-out
+            // branch and its origin counterpart have diverged, e.g. because the upstream history
+            // was rewritten or force-pushed. The clone cannot be updated in place then — but one
+            // that is merely ahead of origin (deliberate local commits, which must be preserved)
+            // or behind it (fast-forwardable) is left alone.
+            val branch = runCatching {
+                parameters.runGit(targetDirectory, "rev-parse", "--abbrev-ref", "HEAD")
+            }.getOrNull()
+            if (branch != null && git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/$branch") &&
+                    !git("merge-base", "--is-ancestor", "origin/$branch", branch) &&
+                    !git("merge-base", "--is-ancestor", branch, "origin/$branch")) {
+                deleteAndReclone("has diverged from origin/$branch (upstream history rewritten or force-pushed?)")
+            }
         }
 
         // SHA of the latest commit across all branches (local + remote-tracking):
