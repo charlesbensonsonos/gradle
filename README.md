@@ -19,7 +19,12 @@ manual version bump needed.
 
 - **`GitRepositorySource`** — clones `repo` into `targetDirectory` (only if that
   directory doesn't already exist; the clone runs in its parent, using its name
-  as the clone target), then runs `git fetch` unless fetching is skipped. It
+  as the clone target), then runs `git fetch` unless fetching is skipped. An
+  existing directory that is **not a clone of `repo`** — its origin remote
+  points at a different repository (e.g. the configured repo changed), or it
+  isn't a git clone at all — is deleted and recloned, with a warning: these
+  clones are machine-managed, so a clone of the wrong remote cannot be
+  deliberate local work. It
   returns the SHA of the **latest commit across all branches**
   (`git rev-list --branches --remotes --max-count=1`), which changes whenever any
   branch gets a new commit.

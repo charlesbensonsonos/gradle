@@ -73,6 +73,10 @@ interface GitCommand {
  *  - The repository named by [Params.repo] is cloned into [Params.targetDirectory]
  *    (the clone runs in that directory's parent, using its name as the clone
  *    target), but only if that directory does not already exist.
+ *  - If the directory exists but is not a clone of [Params.repo] — its origin remote
+ *    points at a different repository (e.g. the configured repo changed), or it is not
+ *    a git clone at all — it is deleted and recloned, with a warning. These clones are
+ *    machine-managed, so a clone of the wrong remote cannot be deliberate local work.
  *  - Unless [Params.skipFetch] is set, `git fetch` updates the remote-tracking refs.
  *  - `git rev-list --branches --remotes --max-count=1` yields the SHA of the latest
  *    commit across all branches, which changes whenever any branch gets a new commit.
@@ -95,7 +99,21 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
     }
 
     /**
-     * Clones the repository into `targetDirectory` if it does not already exist, fetches the
+     * Reduces a git remote URL to a comparable repository identity: the SSH and HTTPS
+     * forms of the same GitHub repository (a clone may use either, given the HTTPS
+     * fallback in [obtain]) and the plain `owner/name` shorthand all normalize to
+     * `owner/name`. Other URLs (e.g. `file://`) are compared as-is, minus any trailing
+     * `/` or `.git`.
+     */
+    private fun repoIdentity(url: String): String = url.trim()
+        .removeSuffix("/")
+        .removeSuffix(".git")
+        .removePrefix("git@github.com:")
+        .replace(Regex("^(?:https?|ssh)://(?:[^@/]+@)?github\\.com/"), "")
+
+    /**
+     * Clones the repository into `targetDirectory` if it does not already exist (an existing
+     * directory that is not a clone of `repo` is deleted and recloned first), fetches the
      * latest changes from the remote (unless `skipFetch` is set), and returns the SHA of the
      * latest commit across all branches. See the class KDoc for the caching rationale.
      */
@@ -107,6 +125,28 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
         val skipFetch = parameters.skipFetch.get()
 
         logger.log(logLevel, "Fetching $repo in $targetDirectory")
+
+        if (targetDirectory.exists()) {
+            // The existing directory may not be a clone of [repo]: the configured repo may have
+            // changed since it was cloned, or a previous clone may have been left broken. These
+            // clones are machine-managed — a clone of the wrong remote cannot be deliberate
+            // local work — so delete it and let the clone below recreate it from [repo].
+            val origin = if (File(targetDirectory, ".git").exists()) {
+                runCatching {
+                    parameters.runGit(targetDirectory, "config", "--get", "remote.origin.url")
+                }.getOrNull()
+            } else {
+                null
+            }
+            if (origin == null || repoIdentity(origin) != repoIdentity(repo)) {
+                val reason = origin?.let { "its origin points at $it instead of $repo" }
+                    ?: "it is not a git clone with an origin remote"
+                logger.warn("  Deleting $targetDirectory and recloning: $reason")
+                if (!targetDirectory.deleteRecursively()) {
+                    throw GradleException("Could not delete $targetDirectory to reclone it from $repo — delete it manually and re-run")
+                }
+            }
+        }
 
         if (!targetDirectory.exists()) {
             // A local `file://` repo is cloned as-is; anything else is treated as a
