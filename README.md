@@ -20,26 +20,14 @@ manual version bump needed.
 - **`GitRepositorySource`** — clones `repo` into `targetDirectory` (only if that
   directory doesn't already exist; the clone runs in its parent, using its name
   as the clone target), then runs `git fetch` unless fetching is skipped. An
-  existing directory that is **not a clone of `repo`** — its origin remote
-  points at a different repository (e.g. the configured repo changed), or it
-  isn't a git clone at all — is deleted and recloned, with a warning: these
-  clones are machine-managed, so a clone of the wrong remote cannot be
-  deliberate local work. It
+  existing directory that isn't a clone of `repo` (e.g. the configured repo
+  changed) is deleted and recloned, with a warning. It
   returns the SHA of the **latest commit across all branches**
   (`git rev-list --branches --remotes --max-count=1`), which changes whenever any
   branch gets a new commit.
 - **`GitBranchSource`** — checks out `branch` in an already-cloned
-  `targetDirectory` and brings it in line with the already-fetched
-  `origin/<branch>` (all local operations, no network), using tiered logic:
-  if the local branch is equal to or **ahead** of origin it is left untouched
-  (deliberate local commits — e.g. developer hacking on the clone — are
-  preserved); if it is simply **behind** it is fast-forwarded
-  (`merge --ff-only`); only if the histories have **diverged** (e.g. the
-  upstream history was rewritten/recreated) or the clone is in a broken state
-  (e.g. stuck mid-merge) is it force-reset to `origin/<branch>`
-  (`checkout -f -B`), with a warning — a diverged local line cannot be
-  developer work on top of the current origin, so nothing meaningful is lost.
-  It returns the branch's **tip commit SHA**
+  `targetDirectory` and fast-forwards it to the already-fetched `origin/<branch>`
+  (a local `git merge`, no network). It returns the branch's **tip commit SHA**
   (`git rev-parse <branch>`), which changes when that branch's tip changes.
 
 ## Entry points
@@ -47,13 +35,12 @@ manual version bump needed.
 Three convenience functions are registered on `extra`:
 
 - **`cloneAndCheckoutGitRepositoryBranch`** — the full path: clone (if needed),
-  fetch, check out `branch`, and update it from the fetched remote-tracking
-  branch (fast-forward when behind; local commits preserved when ahead;
-  force-reset only on divergence). Backed by both value sources.
+  fetch, check out `branch`, and fast-forward it to the fetched remote-tracking
+  branch. Backed by both value sources.
 - **`checkoutGitRepositoryBranch`** — checkout only, for a repository that has
   **already** been cloned/fetched. It neither clones nor fetches; it just checks
-  out `branch` and updates it from the already-fetched `origin/<branch>` (same
-  tiered logic). Backed by `GitBranchSource`.
+  out `branch` and fast-forwards it to the already-fetched `origin/<branch>`.
+  Backed by `GitBranchSource`.
 - **`getCheckoutGitRepositoryBranchProvider`** — same as
   `checkoutGitRepositoryBranch`, but returns the `Provider<String>` (the branch's
   tip SHA) instead of running the checkout eagerly. Call `.get()` on the returned
@@ -89,7 +76,7 @@ val repo = layout.buildDirectory.dir("gradle").get()
 
 cloneAndCheckoutGitRepositoryBranch(
     "Sonos-Inc/gradle",            // repo: owner/name (SSH) or a file:// URI
-    "main",                        // branch to check out and update
+    "main",                        // branch to check out and fast-forward
     repo,                          // local clone directory (Directory)
     "com.sonos.skip-fetch-latest", // skipRemoteFetchProperty (or null for offline-only)
     LogLevel.INFO,                 // log level for progress output
@@ -112,7 +99,7 @@ val checkoutGitRepositoryBranch =
 val repo = layout.buildDirectory.dir("gradle").get()
 
 checkoutGitRepositoryBranch(
-    "release/1.x",   // branch to check out and update
+    "release/1.x",   // branch to check out and fast-forward
   repo,      // local directory of the already-cloned repo (Directory)
     LogLevel.INFO,   // log level for progress output
 )
@@ -127,7 +114,7 @@ apply(from = repo.file("common.gradle.kts"))
 | Parameter                 | Type        | Description                                                                                                     |
 |---------------------------|-------------|-----------------------------------------------------------------------------------------------------------------|
 | `repo`                    | `String`    | Repository to clone: a GitHub `owner/name` (SSH) or `file://` URI.                                              |
-| `branch`                  | `String`    | Git branch to check out and update.                                                                             |
+| `branch`                  | `String`    | Git branch to check out and fast-forward.                                                                       |
 | `targetDirectory`         | `Directory` | Local directory the repo is cloned into (clone runs in its parent, using its name).                             |
 | `skipRemoteFetchProperty` | `String?`   | Property name in `local.sonos.properties` that skips the fetch when `true`; `null` to rely on `--offline` only. |
 | `logLevel`                | `LogLevel`  | Level at which progress is logged.                                                                              |
@@ -139,7 +126,7 @@ Both take the same parameters; `getCheckoutGitRepositoryBranchProvider` returns 
 
 | Parameter         | Type        | Description                                                |
 |-------------------|-------------|------------------------------------------------------------|
-| `branch`          | `String`    | Git branch to check out and update.                        |
+| `branch`          | `String`    | Git branch to check out and fast-forward.                  |
 | `targetDirectory` | `Directory` | Local directory containing the already-cloned repository.  |
 | `logLevel`        | `LogLevel`  | Level at which progress is logged.                         |
 

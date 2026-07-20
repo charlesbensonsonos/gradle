@@ -6,8 +6,8 @@ import org.gradle.api.provider.Property
 import java.util.Properties
 
 /**
- * Mixin providing [runGit] and [tryGit], small helpers for invoking `git` as an external
- * process. Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
+ * Mixin providing [runGit], a small helper for invoking `git` as an external process.
+ * Mixed into each source's [ValueSourceParameters] so `obtain()` can shell out to git.
  */
 interface GitCommand {
     // Runs git in [workingDir], returning trimmed stdout and failing loudly on a non-zero exit.
@@ -40,21 +40,6 @@ interface GitCommand {
         }
         return output
     }
-
-    // Runs git in [workingDir] like [runGit], but returns the exit code instead of
-    // throwing on failure — for commands used as predicates or best-effort attempts.
-    fun tryGit(workingDir: File, vararg args: String): Int {
-        val process = ProcessBuilder(listOf("git", *args))
-            .directory(workingDir)
-            .redirectErrorStream(true)
-            .also {
-                // Never block on an interactive credential prompt; fail fast instead.
-                it.environment()["GIT_TERMINAL_PROMPT"] = "0"
-            }
-            .start()
-        process.inputStream.bufferedReader().readText()
-        return process.waitFor()
-    }
 }
 
 /**
@@ -73,10 +58,8 @@ interface GitCommand {
  *  - The repository named by [Params.repo] is cloned into [Params.targetDirectory]
  *    (the clone runs in that directory's parent, using its name as the clone
  *    target), but only if that directory does not already exist.
- *  - If the directory exists but is not a clone of [Params.repo] — its origin remote
- *    points at a different repository (e.g. the configured repo changed), or it is not
- *    a git clone at all — it is deleted and recloned, with a warning. These clones are
- *    machine-managed, so a clone of the wrong remote cannot be deliberate local work.
+ *  - If the directory exists but is not a clone of [Params.repo] (e.g. the configured
+ *    repo changed), it is deleted and recloned, with a warning.
  *  - Unless [Params.skipFetch] is set, `git fetch` updates the remote-tracking refs.
  *  - `git rev-list --branches --remotes --max-count=1` yields the SHA of the latest
  *    commit across all branches, which changes whenever any branch gets a new commit.
@@ -99,23 +82,10 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
     }
 
     /**
-     * Reduces a git remote URL to a comparable repository identity: the SSH and HTTPS
-     * forms of the same GitHub repository (a clone may use either, given the HTTPS
-     * fallback in [obtain]) and the plain `owner/name` shorthand all normalize to
-     * `owner/name`. Other URLs (e.g. `file://`) are compared as-is, minus any trailing
-     * `/` or `.git`.
-     */
-    private fun repoIdentity(url: String): String = url.trim()
-        .removeSuffix("/")
-        .removeSuffix(".git")
-        .removePrefix("git@github.com:")
-        .replace(Regex("^(?:https?|ssh)://(?:[^@/]+@)?github\\.com/"), "")
-
-    /**
-     * Clones the repository into `targetDirectory` if it does not already exist (an existing
-     * directory that is not a clone of `repo` is deleted and recloned first), fetches the
-     * latest changes from the remote (unless `skipFetch` is set), and returns the SHA of the
-     * latest commit across all branches. See the class KDoc for the caching rationale.
+     * Clones the repository into `targetDirectory` if it does not already exist (deleting and
+     * recloning it first if it is not a clone of `repo`), fetches the latest changes from the
+     * remote (unless `skipFetch` is set), and returns the SHA of the latest commit across all
+     * branches. See the class KDoc for the caching rationale.
      */
     override fun obtain(): String? {
         val logger = Logging.getLogger(GitRepositorySource::class.java)
@@ -127,10 +97,9 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
         logger.log(logLevel, "Fetching $repo in $targetDirectory")
 
         if (targetDirectory.exists()) {
-            // The existing directory may not be a clone of [repo]: the configured repo may have
-            // changed since it was cloned, or a previous clone may have been left broken. These
-            // clones are machine-managed — a clone of the wrong remote cannot be deliberate
-            // local work — so delete it and let the clone below recreate it from [repo].
+            // The configured [repo] may have changed since this directory was cloned (e.g. it
+            // now points at a moved or recreated repository). These clones are machine-managed,
+            // so delete the stale clone and let the clone below recreate it from [repo].
             val origin = if (File(targetDirectory, ".git").exists()) {
                 runCatching {
                     parameters.runGit(targetDirectory, "config", "--get", "remote.origin.url")
@@ -138,10 +107,14 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
             } else {
                 null
             }
-            if (origin == null || repoIdentity(origin) != repoIdentity(repo)) {
-                val reason = origin?.let { "its origin points at $it instead of $repo" }
-                    ?: "it is not a git clone with an origin remote"
-                logger.warn("  Deleting $targetDirectory and recloning: $reason")
+            // The URI forms the clone below can produce (SSH first, HTTPS fallback).
+            val expected = if (repo.startsWith("file://")) {
+                listOf(repo)
+            } else {
+                listOf("git@github.com:$repo.git", "https://github.com/$repo.git")
+            }
+            if (origin !in expected) {
+                logger.warn("  $targetDirectory is not a clone of $repo (origin: $origin) — deleting it and recloning")
                 if (!targetDirectory.deleteRecursively()) {
                     throw GradleException("Could not delete $targetDirectory to reclone it from $repo — delete it manually and re-run")
                 }
@@ -191,10 +164,8 @@ abstract class GitRepositorySource : ValueSource<String, GitRepositorySource.Par
 
 /**
  * A Gradle [ValueSource] provider that checks out a branch in an already-cloned
- * repository, brings it in line with the already-fetched remote-tracking branch
- * (fast-forwarding when behind, preserving local commits when ahead, and
- * force-resetting only when the histories have diverged), and reports the
- * branch's tip commit SHA.
+ * repository, fast-forwards it to the already-fetched remote-tracking branch, and
+ * reports the branch's tip commit SHA.
  *
  * Why a ValueSource? As with [GitRepositorySource], running the checkout here makes
  * it a first-class configuration-cache input: Gradle re-runs [obtain] on each build
@@ -217,19 +188,8 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
     }
 
     /**
-     * Checks out `branch` in the already-cloned `targetDirectory`, brings it in line with the
-     * already-fetched `origin/<branch>` using tiered update logic, and returns the branch's
-     * tip commit SHA:
-     *
-     *  1. If the local branch is equal to or **ahead** of `origin/<branch>`, the clone is left
-     *     untouched — deliberate local (developer) commits on top of origin are preserved.
-     *  2. If it is simply **behind**, it is fast-forwarded to `origin/<branch>`
-     *     (`merge --ff-only`, a local operation — no network).
-     *  3. Only if the histories have **diverged** (e.g. the upstream repository's history was
-     *     rewritten/recreated), or the clone is in a broken state (e.g. left mid-merge), is this
-     *     machine-managed clone force-reset to `origin/<branch>`, with a warning — a diverged
-     *     local line cannot be developer work on top of the current origin.
-     *
+     * Checks out `branch` in the already-cloned `targetDirectory`, merges the already-fetched
+     * `origin/<branch>` to bring it up to date, and returns the branch's tip commit SHA.
      * See the class KDoc for the caching rationale.
      */
     override fun obtain(): String? {
@@ -238,41 +198,15 @@ abstract class GitBranchSource : ValueSource<String, GitBranchSource.Params> {
         val branch = parameters.branch.get()
         val targetDirectory = parameters.targetDirectory.get().asFile
 
-        logger.log(logLevel, "Checking out \"$branch\" and updating it from origin/$branch in $targetDirectory")
+        logger.log(logLevel, "Checking out \"$branch\" and pulling latest in $targetDirectory")
 
-        // Check out the branch, creating it from origin/<branch> only if it doesn't exist locally.
-        // The checkout is allowed to fail here (e.g. a clone left mid-merge by the old merge-based
-        // update): that state is never deliberate local work, so it falls through to the force
-        // reset below instead of aborting the build.
+        // Check out the branch
         logger.log(logLevel, "  Checking out \"$branch\"")
-        val checkedOut = if (parameters.tryGit(targetDirectory, "rev-parse", "--verify", "--quiet", "refs/heads/$branch") == 0) {
-            parameters.tryGit(targetDirectory, "checkout", branch) == 0
-        } else {
-            parameters.tryGit(targetDirectory, "checkout", "-B", branch, "origin/$branch") == 0
-        }
+        parameters.runGit(targetDirectory, "checkout", branch)
 
-        if (checkedOut && parameters.tryGit(targetDirectory, "merge-base", "--is-ancestor", "origin/$branch", branch) == 0) {
-            // origin/<branch> is an ancestor of the local branch: the clone is equal to or ahead
-            // of origin. Leave it untouched — developers deliberately work on top of these clones
-            // (often with fetching skipped), and their local commits must be preserved.
-            if (parameters.runGit(targetDirectory, "rev-parse", branch) !=
-                    parameters.runGit(targetDirectory, "rev-parse", "origin/$branch")) {
-                logger.lifecycle("  Local commits in $targetDirectory are ahead of origin/$branch — leaving clone as-is (developer changes preserved)")
-            }
-        } else if (checkedOut && parameters.tryGit(targetDirectory, "merge", "--ff-only", "origin/$branch") == 0) {
-            // The local branch was simply behind: it has been fast-forwarded to origin/<branch>.
-            // (`--ff-only` never creates a merge state, so a failure here is side-effect free.)
-            logger.log(logLevel, "  Fast-forwarded $branch to origin/$branch")
-        } else {
-            // The fast-forward was impossible (histories diverged or are unrelated — e.g. the
-            // upstream repository's history was rewritten/recreated), or the checkout itself
-            // failed (clone left mid-merge). A diverged local line cannot be developer work on
-            // top of the current origin, and these clones are machine-managed, so force-reset to
-            // origin: `-B` re-points the local branch at origin/<branch>; `-f` discards local
-            // modifications and clears any in-progress merge.
-            logger.warn("  Machine-managed clone in $targetDirectory has diverged from origin/$branch (upstream history rewritten?) — force-resetting it to origin/$branch")
-            parameters.runGit(targetDirectory, "checkout", "-f", "-B", branch, "origin/$branch")
-        }
+        // Bring it up to date with the already-fetched origin/<branch> (local merge, no network)
+        logger.log(logLevel, "  Pulling latest changes for $branch")
+        parameters.runGit(targetDirectory, "merge", "origin/$branch")
 
         // Get the latest commit hash for this branch
         val sha = parameters.runGit(targetDirectory, "rev-parse", branch)
@@ -317,9 +251,7 @@ fun getCheckoutGitRepositoryBranchProvider(branch: String,
  *     )
  *
  * This will clone the repository (if needed) and fetch from the remote, then check out
- * `branch` and update it from the fetched remote-tracking branch (fast-forward when behind,
- * local commits preserved when ahead, force-reset only if the histories have diverged —
- * see [GitBranchSource.obtain]). Fetching is skipped
+ * `branch` and fast-forward it to the fetched remote-tracking branch. Fetching is skipped
  * when Gradle is running offline, or via a property found in local.sonos.properties,
  * of the same name as what the [skipRemoteFetchProperty] argument provides.
  */
@@ -361,9 +293,7 @@ extra["cloneAndCheckoutGitRepositoryBranch"] = fun(repo: String,
  *     checkoutGitRepositoryBranch("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and updates it from the already-fetched `origin/<branch>` (fast-forward
- * when behind, local commits preserved when ahead, force-reset only on divergence — see
- * [GitBranchSource.obtain]).
+ * checks out `branch` and fast-forwards it to the already-fetched `origin/<branch>`.
  */
 extra["checkoutGitRepositoryBranch"] = fun(branch: String,
                                            targetDirectory: Directory,
@@ -383,9 +313,7 @@ extra["checkoutGitRepositoryBranch"] = fun(branch: String,
  *     val provider = getCheckoutGitRepositoryBranchProvider("main", targetDirectory, LogLevel.INFO)
  *
  * Unlike `cloneAndCheckoutGitRepositoryBranch`, this neither clones nor fetches — it only
- * checks out `branch` and updates it from the already-fetched `origin/<branch>` (fast-forward
- * when behind, local commits preserved when ahead, force-reset only on divergence — see
- * [GitBranchSource.obtain]).
+ * checks out `branch` and fast-forwards it to the already-fetched `origin/<branch>`.
  */
 extra["getCheckoutGitRepositoryBranchProvider"] = fun(branch: String,
                                                       targetDirectory: Directory,
